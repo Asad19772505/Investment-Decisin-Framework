@@ -1,5 +1,5 @@
 # app.py  — Buffett-Style Investment Decision Tool (Pro+)
-# Adds: yfinance peers, EV/EBIT & FCF yield, correlated MC, PDF export, and fixes scores_table bug
+# Adds: yfinance peers, EV/EBIT & FCF yield, correlated MC (with unique keys), PDF export, and fixes scores_table bug
 
 import io, json, math
 from datetime import datetime
@@ -8,7 +8,6 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-# New deps
 import yfinance as yf
 import numpy_financial as npf
 from reportlab.lib.pagesizes import A4
@@ -99,7 +98,6 @@ def build_excel_download(bytes_io, overview_dict, inputs_dict, dcf_table, scores
 # yfinance Peer Helpers
 # ---------------------------
 def ttm_sum(df):
-    """Sum last 4 quarters if quarterly dataframe; else NaN-safe sum of all columns."""
     if df is None or df.empty: return np.nan
     try:
         return float(df.iloc[:, :4].sum(axis=1)[0])
@@ -110,18 +108,12 @@ def ttm_sum(df):
             return np.nan
 
 def fetch_peer_metrics(ticker: str):
-    """
-    Returns dict with Price, MarketCap, EV, EBITDA_TTM, EBIT_TTM, FCF_TTM, NetDebt, ROE, D_E,
-    P_E, EV_EBITDA, EV_EBIT, FCF_Yield
-    Best-effort (yfinance fields vary by listing).
-    """
     try:
         tk = yf.Ticker(ticker.strip())
         info = tk.info if hasattr(tk, "info") else {}
         price = info.get("currentPrice") or info.get("regularMarketPrice")
         mcap = info.get("marketCap")
 
-        # Balance sheet / cashflow / financials (quarterly preferred, fall back to annual)
         q_bs = tk.quarterly_balance_sheet
         a_bs = tk.balance_sheet
         q_cf = tk.quarterly_cashflow
@@ -129,12 +121,10 @@ def fetch_peer_metrics(ticker: str):
         q_fs = tk.quarterly_financials
         a_fs = tk.financials
 
-        # Debt & cash
         total_debt = np.nan
         cash = np.nan
         for bs in [q_bs, a_bs]:
             if bs is None or bs.empty: continue
-            # yfinance labels
             for debt_key in ["Total Debt", "Long Term Debt", "Short Long Term Debt"]:
                 if debt_key in bs.index:
                     v = float(bs.loc[debt_key].iloc[0])
@@ -147,19 +137,18 @@ def fetch_peer_metrics(ticker: str):
         net_debt = (total_debt if not np.isnan(total_debt) else 0.0) - (cash if not np.isnan(cash) else 0.0)
         ev = (mcap if mcap else np.nan) + (net_debt if not np.isnan(net_debt) else np.nan)
 
-        # EBIT & EBITDA TTM (Operating Income + D&A)
         ebit_ttm = np.nan
         ebitda_ttm = np.nan
         for fs in [q_fs, a_fs]:
             if fs is None or fs.empty: continue
             if "Operating Income" in fs.index:
                 ebit_ttm = ttm_sum(fs.loc[["Operating Income"]])
-            if "Gross Profit" in fs.index and "Operating Expenses" in fs.index and np.isnan(ebit_ttm):
+            if np.isnan(ebit_ttm):
                 try:
-                    ebit_ttm = ttm_sum(fs.loc[["Gross Profit"]]) - ttm_sum(fs.loc[["Operating Expenses"]])
+                    if "Gross Profit" in fs.index and "Operating Expenses" in fs.index:
+                        ebit_ttm = ttm_sum(fs.loc[["Gross Profit"]]) - ttm_sum(fs.loc[["Operating Expenses"]])
                 except Exception:
                     pass
-        # D&A from cashflow
         dand_ttm = np.nan
         for cf in [q_cf, a_cf]:
             if cf is None or cf.empty: continue
@@ -169,7 +158,6 @@ def fetch_peer_metrics(ticker: str):
         if not np.isnan(ebit_ttm) and not np.isnan(dand_ttm):
             ebitda_ttm = ebit_ttm + dand_ttm
 
-        # FCF TTM
         fcf_ttm = np.nan
         for cf in [q_cf, a_cf]:
             if cf is None or cf.empty: continue
@@ -181,7 +169,6 @@ def fetch_peer_metrics(ticker: str):
                 if not np.isnan(cfo) and not np.isnan(capex):
                     fcf_ttm = cfo + capex  # capex usually negative
 
-        # ROE & D/E from info or compute
         roe = info.get("returnOnEquity")
         de = info.get("debtToEquity")
         eps = info.get("trailingEps")
@@ -189,7 +176,7 @@ def fetch_peer_metrics(ticker: str):
 
         ev_ebitda = safe_div(ev, ebitda_ttm)
         ev_ebit = safe_div(ev, ebit_ttm)
-        fcf_yield = safe_div(fcf_ttm, mcap)  # equity FCF yield
+        fcf_yield = safe_div(fcf_ttm, mcap)
 
         return {
             "Ticker": ticker,
@@ -227,7 +214,7 @@ with st.sidebar.expander("Save / Load Template", expanded=False):
 st.title("Buffett-Style Investment Decision Tool — Extended")
 
 # ---------------------------
-# Tabs (original 6 + peers + MC + sizing + RE)
+# Tabs
 # ---------------------------
 tabs = st.tabs([
     "1) Business Quality",
@@ -414,7 +401,7 @@ with tabs[4]:
     risk_component = max(0.0, 5.0 - 5.0 * risk_deduction)
     total_score = (moat_avg * (moat_weight/100.0) +
                    mgmt_avg * (mgmt_weight/100.0) +
-                   (fin_score) * (fin_weight/100.0) +
+                   fin_score * (fin_weight/100.0) +
                    risk_component * (other_weight/100.0))
     st.metric("Composite Quality Score (0-5)", f"{total_score:.2f}")
     st.session_state["template_state"].update({
@@ -511,14 +498,13 @@ with tabs[5]:
     else:
         dcf_table = pd.DataFrame(columns=["Year","FCF","Discounted FCF"])
 
-    # Excel export
     b = io.BytesIO()
     build_excel_download(b, overview, inputs, dcf_table, scores_table)
     st.download_button("Download Excel Summary", data=b.getvalue(),
                        file_name=f"Buffett_Decision_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-    # ---- Board-ready PDF export ----
+    # Board-ready PDF export
     st.markdown("#### Export Board-Ready PDF")
     pdf_buf = io.BytesIO()
     doc = SimpleDocTemplate(pdf_buf, pagesize=A4, topMargin=24, bottomMargin=24, leftMargin=24, rightMargin=24)
@@ -530,7 +516,6 @@ with tabs[5]:
     elems.append(Paragraph(f"Intrinsic/Share: <b>{_fmt_num(intrinsic_ps,2)} {currency}</b>  •  Target (MOS): <b>{_fmt_num(target_buy_price,2)} {currency}</b>", styles["Normal"]))
     elems.append(Paragraph(f"Composite Quality Score: <b>{_fmt_num(st.session_state['template_state'].get('composite_score_cache', np.nan),2)}</b>", styles["Normal"]))
     elems.append(Spacer(1, 8))
-    # Scores Table
     tbl_data = [["Dimension","Score (0-5)","Weight %"]] + scores_table.values.tolist()
     t = Table(tbl_data)
     t.setStyle(TableStyle([
@@ -542,7 +527,6 @@ with tabs[5]:
     ]))
     elems.append(t)
     elems.append(Spacer(1, 8))
-    # Rationale
     elems.append(Paragraph("<b>Rationale</b>", styles["Heading2"]))
     elems.append(Paragraph("<br/>".join([f"• {r}" for r in reason]) if reason else "—", styles["Normal"]))
     doc.build(elems)
@@ -560,18 +544,15 @@ with tabs[6]:
             rows.append(fetch_peer_metrics(tk))
         if rows:
             peers = pd.DataFrame(rows)
-            # Display core metrics
             show = ["Ticker","Price","P_E","EV_EBITDA","EV_EBIT","ROE","D_E","FCF_Yield","MarketCap","EV","EBITDA_TTM","EBIT_TTM","FCF_TTM","NetDebt"]
             show = [c for c in show if c in peers.columns]
             st.dataframe(peers[show], use_container_width=True)
-            # Boxplots
             for metric in ["P_E","EV_EBITDA","EV_EBIT","ROE","D_E","FCF_Yield"]:
                 if metric in peers.columns and peers[metric].notna().sum() > 1:
                     fig = plt.figure()
                     plt.boxplot(peers[metric].replace([np.inf,-np.inf], np.nan).dropna())
                     plt.title(f"{metric} — Distribution")
                     st.pyplot(fig)
-            # Save to Excel for export page
             st.session_state["peers_df"] = peers
             st.success("Peers fetched.")
 
@@ -579,23 +560,29 @@ with tabs[6]:
 with tabs[7]:
     st.subheader("Monte Carlo on Growth & WACC — Correlated Draws")
     c1, c2, c3 = st.columns(3)
-    mc_n = int(c1.number_input("Simulations", 1000, 2_000_000, 50_000, step=5000))
-    g_mean = c2.number_input("Growth mean Y1–5 (%)", value=st.session_state["template_state"].get("g_mean", 8.0))
-    g_sd = c3.number_input("Growth std dev (pp)", value=st.session_state["template_state"].get("g_sd", 3.0))
-    c4, c5, c6 = st.columns(3)
-    wacc_mean = c4.number_input("WACC mean (%)", value=st.session_state["template_state"].get("wacc_mean", 12.0))
-    wacc_sd = c5.number_input("WACC std dev (pp)", value=st.session_state["template_state"].get("wacc_sd", 2.0))
-    rho = c6.number_input("Correlation (growth, WACC) [-1..1]", value=-0.5, min_value=-1.0, max_value=1.0, step=0.05)
-    base_fcf_mc = st.number_input("Base FCF / OE", value=st.session_state["template_state"].get("base_fcf_mc", 100_000_000.0), step=1e6, format="%.0f")
-    net_debt_mc = st.number_input("Net Debt", value=st.session_state["template_state"].get("net_debt_mc", 0.0), step=1e6, format="%.0f")
-    shares_mc = st.number_input("Shares Outstanding", value=st.session_state["template_state"].get("shares_mc", 100_000_000.0), step=1e6, format="%.0f")
-    market_px_mc = st.number_input("Market Price / Share (optional)", value=st.session_state["template_state"].get("mkt_px_mc", 0.0), step=0.01, format="%.2f")
-    g_term_mc = st.number_input("Terminal growth (%)", value=st.session_state["template_state"].get("g_term_mc", 3.0))
+    mc_n = int(c1.number_input("Simulations", 1000, 2_000_000, 50_000, step=5000, key="mc_n"))
+    g_mean = c2.number_input("Growth mean Y1–5 (%)", value=st.session_state["template_state"].get("g_mean", 8.0), key="mc_g_mean")
+    g_sd = c3.number_input("Growth std dev (pp)", value=st.session_state["template_state"].get("g_sd", 3.0), key="mc_g_sd")
 
-    run = st.button("Run Monte Carlo (Correlated)")
+    c4, c5, c6 = st.columns(3)
+    wacc_mean = c4.number_input("WACC mean (%)", value=st.session_state["template_state"].get("wacc_mean", 12.0), key="mc_wacc_mean")
+    wacc_sd = c5.number_input("WACC std dev (pp)", value=st.session_state["template_state"].get("wacc_sd", 2.0), key="mc_wacc_sd")
+    rho = c6.number_input("Correlation (growth, WACC) [-1..1]", value=-0.5, min_value=-1.0, max_value=1.0, step=0.05, key="mc_rho")
+
+    base_fcf_mc = st.number_input("Base FCF / OE", value=st.session_state["template_state"].get("base_fcf_mc", 100_000_000.0),
+                                  step=1e6, format="%.0f", key="mc_base_fcf")
+    net_debt_mc = st.number_input("Net Debt", value=st.session_state["template_state"].get("net_debt_mc", 0.0),
+                                  step=1e6, format="%.0f", key="mc_net_debt")
+    shares_mc = st.number_input("Shares Outstanding", value=st.session_state["template_state"].get("shares_mc", 100_000_000.0),
+                                step=1e6, format="%.0f", key="mc_shares")
+    market_px_mc = st.number_input("Market Price / Share (optional)", value=st.session_state["template_state"].get("mkt_px_mc", 0.0),
+                                   step=0.01, format="%.2f", key="mc_mkt_px")
+    g_term_mc = st.number_input("Terminal growth (%)", value=st.session_state["template_state"].get("g_term_mc", 3.0),
+                                key="mc_g_term")
+
+    run = st.button("Run Monte Carlo (Correlated)", key="mc_run_btn")
     if run:
         rng = np.random.default_rng(42)
-        # Correlated normals via Cholesky
         cov = np.array([[ (g_sd/100.0)**2, rho*(g_sd/100.0)*(wacc_sd/100.0)],
                         [ rho*(g_sd/100.0)*(wacc_sd/100.0), (wacc_sd/100.0)**2 ]])
         L = np.linalg.cholesky(cov) if np.all(np.linalg.eigvals(cov) > 0) else np.linalg.cholesky(cov + 1e-12*np.eye(2))
@@ -607,7 +594,7 @@ with tabs[7]:
 
         ev = np.empty(mc_n); ev[:] = np.nan
         for i in range(mc_n):
-            if wacc_draws[i] <= g_term_v:  # discard invalid
+            if wacc_draws[i] <= g_term_v:
                 continue
             pv, _, _ = dcf_from_fcf(base_fcf_mc, g_draws[i], wacc_draws[i], g_term_v, years=5)
             ev[i] = pv
@@ -615,7 +602,7 @@ with tabs[7]:
         ps = eq / shares_mc
         ps = pd.Series(ps).replace([np.inf,-np.inf], np.nan).dropna()
         if len(ps) == 0:
-            st.error("No valid simulations (likely WACC <= terminal growth too often). Adjust inputs.")
+            st.error("No valid simulations (WACC <= terminal growth too often). Adjust inputs.")
         else:
             p5, p50, p95 = ps.quantile([0.05,0.50,0.95])
             st.metric("P5 / P50 / P95 Intrinsic Value per Share", f"{p5:,.2f} / {p50:,.2f} / {p95:,.2f}")
@@ -699,7 +686,6 @@ with tabs[9]:
         disc = st.number_input("Discount Rate (%)", value=12.0)
         loan_rate = st.number_input("Construction Loan Rate (%)", value=9.0)
         ltc = st.number_input("LTC (%)", value=60.0)
-        # S-curve weights
         t_cost = max(1, int(build_years))
         x = np.linspace(0, 1, t_cost)
         s_curve = 3*x**2 - 2*x**3
