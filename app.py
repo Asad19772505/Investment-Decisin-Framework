@@ -1,4 +1,6 @@
-# app.py
+# app.py  — Buffett-Style Investment Decision Tool (Pro+)
+# Adds: yfinance peers, EV/EBIT & FCF yield, correlated MC, PDF export, and fixes scores_table bug
+
 import io, json, math
 from datetime import datetime
 import numpy as np
@@ -6,7 +8,15 @@ import pandas as pd
 import streamlit as st
 import matplotlib.pyplot as plt
 
-st.set_page_config(page_title="Buffett-Style Investment Decision Tool (Pro)", layout="wide")
+# New deps
+import yfinance as yf
+import numpy_financial as npf
+from reportlab.lib.pagesizes import A4
+from reportlab.lib import colors
+from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle
+
+st.set_page_config(page_title="Buffett-Style Investment Decision Tool (Pro+)", layout="wide")
 
 # ---------------------------
 # Generic Helpers
@@ -23,7 +33,7 @@ def _fmt_num(x, decimals=0):
 
 def safe_div(a, b):
     try:
-        if b in (0, None) or (isinstance(b, float) and np.isnan(b)): return np.nan
+        if b in (0, None) or (isinstance(b, float) and np.isnan(b)) or b == 0: return np.nan
         return a / b
     except: return np.nan
 
@@ -41,8 +51,7 @@ def dcf_from_fcf(base_fcf, growth_yrs_1_5, wacc, terminal_growth, years=5):
         pv += cf_t / ((1 + wacc) ** t)
     fcf_6 = base_fcf * ((1 + growth_yrs_1_5) ** (years + 1))
     terminal = fcf_6 * (1 + terminal_growth) / (wacc - terminal_growth)
-    pv_terminal = terminal / ((1 + wacc) ** years)
-    total_pv = pv + pv_terminal
+    total_pv = pv + terminal / ((1 + wacc) ** years)
     return total_pv, cf_list, terminal
 
 def summarize_financials(df):
@@ -81,16 +90,121 @@ def build_excel_download(bytes_io, overview_dict, inputs_dict, dcf_table, scores
         if extra_sheets:
             for name, df in extra_sheets.items():
                 df.to_excel(writer, sheet_name=name, index=False)
-        wb = writer.book
         for ws_name in writer.sheets.keys():
             ws = writer.sheets[ws_name]
             ws.set_column("A:A", 30)
             ws.set_column("B:Z", 18)
 
 # ---------------------------
+# yfinance Peer Helpers
+# ---------------------------
+def ttm_sum(df):
+    """Sum last 4 quarters if quarterly dataframe; else NaN-safe sum of all columns."""
+    if df is None or df.empty: return np.nan
+    try:
+        return float(df.iloc[:, :4].sum(axis=1)[0])
+    except Exception:
+        try:
+            return float(df.sum(axis=1)[0])
+        except Exception:
+            return np.nan
+
+def fetch_peer_metrics(ticker: str):
+    """
+    Returns dict with Price, MarketCap, EV, EBITDA_TTM, EBIT_TTM, FCF_TTM, NetDebt, ROE, D_E,
+    P_E, EV_EBITDA, EV_EBIT, FCF_Yield
+    Best-effort (yfinance fields vary by listing).
+    """
+    try:
+        tk = yf.Ticker(ticker.strip())
+        info = tk.info if hasattr(tk, "info") else {}
+        price = info.get("currentPrice") or info.get("regularMarketPrice")
+        mcap = info.get("marketCap")
+
+        # Balance sheet / cashflow / financials (quarterly preferred, fall back to annual)
+        q_bs = tk.quarterly_balance_sheet
+        a_bs = tk.balance_sheet
+        q_cf = tk.quarterly_cashflow
+        a_cf = tk.cashflow
+        q_fs = tk.quarterly_financials
+        a_fs = tk.financials
+
+        # Debt & cash
+        total_debt = np.nan
+        cash = np.nan
+        for bs in [q_bs, a_bs]:
+            if bs is None or bs.empty: continue
+            # yfinance labels
+            for debt_key in ["Total Debt", "Long Term Debt", "Short Long Term Debt"]:
+                if debt_key in bs.index:
+                    v = float(bs.loc[debt_key].iloc[0])
+                    total_debt = (0 if np.isnan(total_debt) else total_debt) + v
+            if "Cash And Cash Equivalents" in bs.index:
+                cash = float(bs.loc["Cash And Cash Equivalents"].iloc[0])
+            elif "Cash" in bs.index:
+                cash = float(bs.loc["Cash"].iloc[0])
+
+        net_debt = (total_debt if not np.isnan(total_debt) else 0.0) - (cash if not np.isnan(cash) else 0.0)
+        ev = (mcap if mcap else np.nan) + (net_debt if not np.isnan(net_debt) else np.nan)
+
+        # EBIT & EBITDA TTM (Operating Income + D&A)
+        ebit_ttm = np.nan
+        ebitda_ttm = np.nan
+        for fs in [q_fs, a_fs]:
+            if fs is None or fs.empty: continue
+            if "Operating Income" in fs.index:
+                ebit_ttm = ttm_sum(fs.loc[["Operating Income"]])
+            if "Gross Profit" in fs.index and "Operating Expenses" in fs.index and np.isnan(ebit_ttm):
+                try:
+                    ebit_ttm = ttm_sum(fs.loc[["Gross Profit"]]) - ttm_sum(fs.loc[["Operating Expenses"]])
+                except Exception:
+                    pass
+        # D&A from cashflow
+        dand_ttm = np.nan
+        for cf in [q_cf, a_cf]:
+            if cf is None or cf.empty: continue
+            for key in ["Depreciation", "Depreciation And Amortization"]:
+                if key in cf.index:
+                    dand_ttm = ttm_sum(cf.loc[[key]])
+        if not np.isnan(ebit_ttm) and not np.isnan(dand_ttm):
+            ebitda_ttm = ebit_ttm + dand_ttm
+
+        # FCF TTM
+        fcf_ttm = np.nan
+        for cf in [q_cf, a_cf]:
+            if cf is None or cf.empty: continue
+            if "Free Cash Flow" in cf.index:
+                fcf_ttm = ttm_sum(cf.loc[["Free Cash Flow"]])
+            else:
+                cfo = ttm_sum(cf.loc[["Total Cash From Operating Activities"]]) if "Total Cash From Operating Activities" in cf.index else np.nan
+                capex = ttm_sum(cf.loc[["Capital Expenditures"]]) if "Capital Expenditures" in cf.index else np.nan
+                if not np.isnan(cfo) and not np.isnan(capex):
+                    fcf_ttm = cfo + capex  # capex usually negative
+
+        # ROE & D/E from info or compute
+        roe = info.get("returnOnEquity")
+        de = info.get("debtToEquity")
+        eps = info.get("trailingEps")
+        pe = price / eps if price and eps and eps != 0 else np.nan
+
+        ev_ebitda = safe_div(ev, ebitda_ttm)
+        ev_ebit = safe_div(ev, ebit_ttm)
+        fcf_yield = safe_div(fcf_ttm, mcap)  # equity FCF yield
+
+        return {
+            "Ticker": ticker,
+            "Price": price, "MarketCap": mcap, "EV": ev,
+            "EBITDA_TTM": ebitda_ttm, "EBIT_TTM": ebit_ttm, "FCF_TTM": fcf_ttm,
+            "NetDebt": net_debt, "ROE": roe, "D_E": de,
+            "P_E": pe, "EV_EBITDA": ev_ebitda, "EV_EBIT": ev_ebit, "FCF_Yield": fcf_yield
+        }
+    except Exception:
+        return {"Ticker": ticker}
+
+# ---------------------------
 # Sidebar
 # ---------------------------
-st.sidebar.title("Buffett-Style Tool (Pro)")
+st.sidebar.title("Buffett-Style Tool (Pro+)")
 st.sidebar.caption("Quality first • Margin of Safety • Owner mindset")
 
 with st.sidebar.expander("Save / Load Template", expanded=False):
@@ -113,7 +227,7 @@ with st.sidebar.expander("Save / Load Template", expanded=False):
 st.title("Buffett-Style Investment Decision Tool — Extended")
 
 # ---------------------------
-# Tabs (original 6 + 4 new)
+# Tabs (original 6 + peers + MC + sizing + RE)
 # ---------------------------
 tabs = st.tabs([
     "1) Business Quality",
@@ -122,8 +236,8 @@ tabs = st.tabs([
     "4) Valuation (DCF)",
     "5) Risk & MOS",
     "6) Verdict & Export",
-    "7) Peer Benchmarking",
-    "8) Monte Carlo",
+    "7) Peer Benchmarking (Auto via yfinance)",
+    "8) Monte Carlo (Correlated)",
     "9) Trade Sizing",
     "10) Real Estate"
 ])
@@ -345,7 +459,7 @@ with tabs[5]:
     st.markdown(f"### **Verdict: {decision}**")
     st.write("- " + "\n- ".join(reason))
 
-    # Export
+    # ---- Scores table (FIXED bug) ----
     moat_avg = np.mean([st.session_state["template_state"]["moat_brand"],
                         st.session_state["template_state"]["moat_cost"],
                         st.session_state["template_state"]["moat_network"],
@@ -355,12 +469,22 @@ with tabs[5]:
                         st.session_state["template_state"]["mgmt_transparency"],
                         st.session_state["template_state"]["mgmt_alignment"]])
     scores_table = pd.DataFrame([
-        {"Dimension":"Business Quality (Moat)", "Score (0-5)": round(moat_avg,2), "Weight %": st.session_state["template_state"]["moat_weight"]},
-        {"Dimension":"Management", "Score (0-5)": round(mgmt_avg,2), "Weight %": st.session_state["template_state"]["mgmt_weight"]},
-        {"Dimension":"Financial Strength", "Score (0-5)": round(st.session_state["template_state"].get("fin_score_cache", np.nan),2), "Weight %": st.session_state["template_state"]["fin_weight"]},
-        {"Dimension":"Risk Component", "Score (0-5)": "Derived", "Weight %": max(0, 100 - (st.session_state["template_state"]["moat_weight"] + st.session_state["template_state"]["mgmt_weight"] + st.session_state["template_state"]["fin_weight"])},
-        {"Dimension":"Composite", "Score (0-5)": round(st.session_state["template_state"].get("composite_score_cache", np.nan),2), "Weight %": 100}
+        {"Dimension":"Business Quality (Moat)", "Score (0-5)": round(moat_avg,2),
+         "Weight %": st.session_state["template_state"]["moat_weight"]},
+        {"Dimension":"Management", "Score (0-5)": round(mgmt_avg,2),
+         "Weight %": st.session_state["template_state"]["mgmt_weight"]},
+        {"Dimension":"Financial Strength", "Score (0-5)": round(st.session_state["template_state"].get("fin_score_cache", np.nan),2),
+         "Weight %": st.session_state["template_state"]["fin_weight"]},
+        {"Dimension":"Risk Component", "Score (0-5)": "Derived",
+         "Weight %": max(0, 100 - (
+             st.session_state["template_state"]["moat_weight"] +
+             st.session_state["template_state"]["mgmt_weight"] +
+             st.session_state["template_state"]["fin_weight"]
+         ))},
+        {"Dimension":"Composite", "Score (0-5)": round(st.session_state["template_state"].get("composite_score_cache", np.nan),2),
+         "Weight %": 100}
     ])
+
     overview = {
         "Decision": decision,
         "Intrinsic / Share": f"{intrinsic_ps:,.2f} {currency}" if not pd.isna(intrinsic_ps) else "—",
@@ -386,89 +510,123 @@ with tabs[5]:
         dcf_table = pd.DataFrame({"Year": years, "FCF": cf_list, "Discounted FCF": disc})
     else:
         dcf_table = pd.DataFrame(columns=["Year","FCF","Discounted FCF"])
+
+    # Excel export
     b = io.BytesIO()
     build_excel_download(b, overview, inputs, dcf_table, scores_table)
     st.download_button("Download Excel Summary", data=b.getvalue(),
                        file_name=f"Buffett_Decision_{datetime.now().strftime('%Y%m%d_%H%M')}.xlsx",
                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-# ========== 7) Peer Benchmarking ==========
-with tabs[6]:
-    st.subheader("Peer Benchmarking (ROE, Leverage, Multiples)")
-    st.caption("Upload peers (CSV/XLSX). Columns (case-insensitive): Name/Ticker, Price, EPS, EV, EBITDA, NetDebt, Equity, ROE, DebtEquity, Sales, NetIncome")
-    uplp = st.file_uploader("Upload peer set", type=["csv","xlsx","xls"], key="peer_upl")
-    if uplp:
-        peers = pd.read_csv(uplp) if uplp.name.lower().endswith(".csv") else pd.read_excel(uplp)
-        c = {x.lower():x for x in peers.columns}
-        def g(k): return peers[c[k]] if k in c else np.nan
-        peers["P_E"] = g("price")/g("eps")
-        peers["EV_EBITDA"] = g("ev")/g("ebitda")
-        if "roe" not in c and "netincome" in c and "equity" in c:
-            peers["ROE"] = g("netincome")/g("equity")
-        elif "roe" in c:
-            peers["ROE"] = g("roe")
-        else:
-            peers["ROE"] = np.nan
-        peers["D_E"] = g("debtequity") if "debtequity" in c else np.nan
-        show_cols = [x for x in ["Name","Ticker","Price","P_E","EV_EBITDA","ROE","D_E"] if x in peers.columns] + ["P_E","EV_EBITDA","ROE","D_E"]
-        show_cols = list(dict.fromkeys(show_cols))  # dedupe
-        st.dataframe(peers[show_cols], use_container_width=True)
-        # Simple boxplots via matplotlib
-        for metric in ["P_E","EV_EBITDA","ROE","D_E"]:
-            if metric in peers.columns:
-                fig = plt.figure()
-                plt.boxplot(peers[metric].replace([np.inf,-np.inf], np.nan).dropna())
-                plt.title(f"{metric} — Distribution")
-                st.pyplot(fig)
+    # ---- Board-ready PDF export ----
+    st.markdown("#### Export Board-Ready PDF")
+    pdf_buf = io.BytesIO()
+    doc = SimpleDocTemplate(pdf_buf, pagesize=A4, topMargin=24, bottomMargin=24, leftMargin=24, rightMargin=24)
+    styles = getSampleStyleSheet()
+    elems = []
+    elems.append(Paragraph("<b>Investment Decision Summary</b>", styles["Title"]))
+    elems.append(Spacer(1, 8))
+    elems.append(Paragraph(f"Verdict: <b>{decision}</b>", styles["Heading2"]))
+    elems.append(Paragraph(f"Intrinsic/Share: <b>{_fmt_num(intrinsic_ps,2)} {currency}</b>  •  Target (MOS): <b>{_fmt_num(target_buy_price,2)} {currency}</b>", styles["Normal"]))
+    elems.append(Paragraph(f"Composite Quality Score: <b>{_fmt_num(st.session_state['template_state'].get('composite_score_cache', np.nan),2)}</b>", styles["Normal"]))
+    elems.append(Spacer(1, 8))
+    # Scores Table
+    tbl_data = [["Dimension","Score (0-5)","Weight %"]] + scores_table.values.tolist()
+    t = Table(tbl_data)
+    t.setStyle(TableStyle([
+        ("BACKGROUND",(0,0),(-1,0), colors.black),
+        ("TEXTCOLOR",(0,0),(-1,0), colors.white),
+        ("ALIGN",(0,0),(-1,-1),"CENTER"),
+        ("GRID",(0,0),(-1,-1),0.25, colors.grey),
+        ("BACKGROUND",(0,1),(-1,-1), colors.whitesmoke),
+    ]))
+    elems.append(t)
+    elems.append(Spacer(1, 8))
+    # Rationale
+    elems.append(Paragraph("<b>Rationale</b>", styles["Heading2"]))
+    elems.append(Paragraph("<br/>".join([f"• {r}" for r in reason]) if reason else "—", styles["Normal"]))
+    doc.build(elems)
+    st.download_button("Download PDF Summary", data=pdf_buf.getvalue(),
+                       file_name=f"Investment_Summary_{datetime.now().strftime('%Y%m%d_%H%M')}.pdf",
+                       mime="application/pdf")
 
-# ========== 8) Monte Carlo ==========
+# ========== 7) Peer Benchmarking (Auto via yfinance) ==========
+with tabs[6]:
+    st.subheader("Peer Benchmarking — Auto Fetch with yfinance")
+    tickers = st.text_input("Enter comma-separated tickers (e.g., AAPL,MSFT,NVDA)", value=st.session_state["template_state"].get("peer_tickers",""))
+    if st.button("Fetch Peers"):
+        rows = []
+        for tk in [t.strip() for t in tickers.split(",") if t.strip()]:
+            rows.append(fetch_peer_metrics(tk))
+        if rows:
+            peers = pd.DataFrame(rows)
+            # Display core metrics
+            show = ["Ticker","Price","P_E","EV_EBITDA","EV_EBIT","ROE","D_E","FCF_Yield","MarketCap","EV","EBITDA_TTM","EBIT_TTM","FCF_TTM","NetDebt"]
+            show = [c for c in show if c in peers.columns]
+            st.dataframe(peers[show], use_container_width=True)
+            # Boxplots
+            for metric in ["P_E","EV_EBITDA","EV_EBIT","ROE","D_E","FCF_Yield"]:
+                if metric in peers.columns and peers[metric].notna().sum() > 1:
+                    fig = plt.figure()
+                    plt.boxplot(peers[metric].replace([np.inf,-np.inf], np.nan).dropna())
+                    plt.title(f"{metric} — Distribution")
+                    st.pyplot(fig)
+            # Save to Excel for export page
+            st.session_state["peers_df"] = peers
+            st.success("Peers fetched.")
+
+# ========== 8) Monte Carlo (Correlated) ==========
 with tabs[7]:
-    st.subheader("Monte Carlo on Growth & WACC")
-    st.caption("Simulate uncertainty around growth (Y1–5) and WACC to get a distribution of intrinsic value per share.")
+    st.subheader("Monte Carlo on Growth & WACC — Correlated Draws")
     c1, c2, c3 = st.columns(3)
-    mc_n = int(c1.number_input("Simulations (e.g., 50,000)", 1000, 2_000_000, 50_000, step=5000))
+    mc_n = int(c1.number_input("Simulations", 1000, 2_000_000, 50_000, step=5000))
     g_mean = c2.number_input("Growth mean Y1–5 (%)", value=st.session_state["template_state"].get("g_mean", 8.0))
     g_sd = c3.number_input("Growth std dev (pp)", value=st.session_state["template_state"].get("g_sd", 3.0))
     c4, c5, c6 = st.columns(3)
     wacc_mean = c4.number_input("WACC mean (%)", value=st.session_state["template_state"].get("wacc_mean", 12.0))
     wacc_sd = c5.number_input("WACC std dev (pp)", value=st.session_state["template_state"].get("wacc_sd", 2.0))
-    g_term = c6.number_input("Terminal growth (%)", value=st.session_state["template_state"].get("g_term_mc", 3.0))
-    base_fcf = st.number_input("Base FCF / OE (currency)", value=st.session_state["template_state"].get("base_fcf_mc", 100_000_000.0), step=1e6, format="%.0f")
-    net_debt = st.number_input("Net Debt (currency)", value=st.session_state["template_state"].get("net_debt_mc", 0.0), step=1e6, format="%.0f")
-    shares_out = st.number_input("Shares Outstanding", value=st.session_state["template_state"].get("shares_mc", 100_000_000.0), step=1e6, format="%.0f")
-    market_price = st.number_input("Market Price / Share (optional)", value=st.session_state["template_state"].get("mkt_px_mc", 0.0), step=0.01, format="%.2f")
+    rho = c6.number_input("Correlation (growth, WACC) [-1..1]", value=-0.5, min_value=-1.0, max_value=1.0, step=0.05)
+    base_fcf_mc = st.number_input("Base FCF / OE", value=st.session_state["template_state"].get("base_fcf_mc", 100_000_000.0), step=1e6, format="%.0f")
+    net_debt_mc = st.number_input("Net Debt", value=st.session_state["template_state"].get("net_debt_mc", 0.0), step=1e6, format="%.0f")
+    shares_mc = st.number_input("Shares Outstanding", value=st.session_state["template_state"].get("shares_mc", 100_000_000.0), step=1e6, format="%.0f")
+    market_px_mc = st.number_input("Market Price / Share (optional)", value=st.session_state["template_state"].get("mkt_px_mc", 0.0), step=0.01, format="%.2f")
+    g_term_mc = st.number_input("Terminal growth (%)", value=st.session_state["template_state"].get("g_term_mc", 3.0))
 
-    run = st.button("Run Monte Carlo")
+    run = st.button("Run Monte Carlo (Correlated)")
     if run:
         rng = np.random.default_rng(42)
-        g_draws = rng.normal(g_mean/100.0, g_sd/100.0, mc_n)
-        wacc_draws = rng.normal(wacc_mean/100.0, wacc_sd/100.0, mc_n)
-        g_term_v = g_term/100.0
+        # Correlated normals via Cholesky
+        cov = np.array([[ (g_sd/100.0)**2, rho*(g_sd/100.0)*(wacc_sd/100.0)],
+                        [ rho*(g_sd/100.0)*(wacc_sd/100.0), (wacc_sd/100.0)**2 ]])
+        L = np.linalg.cholesky(cov) if np.all(np.linalg.eigvals(cov) > 0) else np.linalg.cholesky(cov + 1e-12*np.eye(2))
+        Z = rng.normal(size=(2, mc_n))
+        draws = (L @ Z).T
+        g_draws = g_mean/100.0 + draws[:,0]
+        wacc_draws = wacc_mean/100.0 + draws[:,1]
+        g_term_v = g_term_mc/100.0
+
         ev = np.empty(mc_n); ev[:] = np.nan
         for i in range(mc_n):
             if wacc_draws[i] <= g_term_v:  # discard invalid
                 continue
-            pv, _, _ = dcf_from_fcf(base_fcf, g_draws[i], wacc_draws[i], g_term_v, years=5)
+            pv, _, _ = dcf_from_fcf(base_fcf_mc, g_draws[i], wacc_draws[i], g_term_v, years=5)
             ev[i] = pv
-        eq = ev - net_debt
-        ps = eq / shares_out
+        eq = ev - net_debt_mc
+        ps = eq / shares_mc
         ps = pd.Series(ps).replace([np.inf,-np.inf], np.nan).dropna()
         if len(ps) == 0:
             st.error("No valid simulations (likely WACC <= terminal growth too often). Adjust inputs.")
         else:
             p5, p50, p95 = ps.quantile([0.05,0.50,0.95])
             st.metric("P5 / P50 / P95 Intrinsic Value per Share", f"{p5:,.2f} / {p50:,.2f} / {p95:,.2f}")
-            if market_price > 0:
-                prob_undervalued = (ps >= market_price).mean()
-                st.write(f"Probability intrinsic ≥ market: **{_fmt_pct(prob_undervalued)}**")
-            # Histogram
+            if market_px_mc > 0:
+                st.write(f"Probability intrinsic ≥ market: **{_fmt_pct((ps >= market_px_mc).mean())}**")
             fig = plt.figure()
             plt.hist(ps, bins=60)
-            plt.title("Intrinsic Value / Share — Monte Carlo")
+            plt.title("Intrinsic Value / Share — Monte Carlo (Correlated)")
             plt.xlabel("Value")
             plt.ylabel("Frequency")
             st.pyplot(fig)
-            # Download
             out = io.BytesIO()
             pd.DataFrame({"intrinsic_ps": ps}).to_csv(out, index=False)
             st.download_button("Download Simulation CSV", out.getvalue(), file_name="mc_intrinsic_values.csv", mime="text/csv")
@@ -476,7 +634,7 @@ with tabs[7]:
 # ========== 9) Trade Sizing ==========
 with tabs[8]:
     st.subheader("Position Sizing — Kelly & Volatility Target")
-    st.caption("Two approaches: (1) Kelly fraction using expected return & variance (proxy), (2) Target portfolio volatility. Apply guardrails.")
+    st.caption("Two approaches: (1) Kelly fraction using excess return & variance (proxy), (2) Target portfolio volatility.")
     c1, c2, c3 = st.columns(3)
     exp_ret = c1.number_input("Expected annual return (μ, %)", value=15.0)
     ann_vol = c2.number_input("Annualized volatility (σ, %)", value=25.0, min_value=0.01)
@@ -486,18 +644,15 @@ with tabs[8]:
     st.metric("Kelly fraction (bounded 0..1)", f"{kelly:.2f}")
     st.caption("Rule of thumb: deploy half-Kelly to reduce path risk.")
     tgt_vol = st.number_input("Target portfolio volatility (%, optional)", value=10.0)
-    est_vol_asset = ann_vol
-    vol_pos = float(np.clip((tgt_vol/est_vol_asset), 0, 1)) if est_vol_asset > 0 else 0.0
-    st.metric("Volatility-target position size", f"{vol_pos:.2f}")
-    # Guardrails
+    vol_pos = float(np.clip((tgt_vol/max(ann_vol, 1e-9)), 0, 1))
     c4, c5, c6 = st.columns(3)
     max_weight = c4.number_input("Max position weight", 0.0, 1.0, 0.15)
     dd_stop = c5.number_input("Drawdown stop-loss (%, optional)", 0.0, 100.0, 25.0)
     cash_buffer = c6.number_input("Cash buffer (%)", 0.0, 50.0, 5.0)
     suggested = min(kelly*0.5, vol_pos, max_weight)
-    st.markdown(f"**Suggested position weight:** {suggested:.2f} (min of ½-Kelly, vol-target, max weight)")
+    st.markdown(f"**Suggested position weight:** {suggested:.2f} (min of ½-Kelly, vol-target, max)")
 
-# ========== 10) Real Estate Variant ==========
+# ========== 10) Real Estate ==========
 with tabs[9]:
     st.subheader("Real Estate — Income Asset & Development")
     sub = st.radio("Mode", ["Income Property (NOI/Cap/DSCR)","Development (Curves & IRR)"])
@@ -510,37 +665,26 @@ with tabs[9]:
         hold = st.number_input("Hold Period (years)", value=5, step=1)
         noi_growth = st.number_input("NOI Growth (%)", value=3.0)
         disc = st.number_input("Discount Rate (%)", value=12.0)
-        # Value via cap on Y1 NOI
         value_now = noi_y1 / (cap_rate/100.0)
-        # Cash flows: growing NOI; terminal via exit cap on NOI at year N+1
         cfs = []
         for t in range(1, hold+1):
             noi_t = noi_y1 * ((1+noi_growth/100.0)**(t-1))
             cfs.append(noi_t)
         noi_next = noi_y1 * ((1+noi_growth/100.0)**hold)
         terminal = noi_next / (exit_cap/100.0)
-        pv = 0.0
-        for t, cf in enumerate(cfs, start=1):
-            pv += cf / ((1+disc/100.0)**t)
-        pv_term = terminal / ((1+disc/100.0)**hold)
-        dcf_value = pv + pv_term
+        pv = sum(cf / ((1+disc/100.0)**t) for t, cf in enumerate(cfs, start=1))
+        dcf_value = pv + terminal / ((1+disc/100.0)**hold)
         st.metric("Cap Value (NOI/Cap)", f"{_fmt_num(value_now)}")
         st.metric("DCF Value", f"{_fmt_num(dcf_value)}")
-        # Debt & DSCR
         st.markdown("### Debt & DSCR")
         c4,c5,c6 = st.columns(3)
         ltv = c4.number_input("LTV (%)", value=60.0)
         loan_rate = c5.number_input("Loan rate (%)", value=7.0)
         amort_years = c6.number_input("Amortization (years)", value=20, step=1)
         loan_amt = value_now * (ltv/100.0)
-        # Annual payment (annuity)
         r = loan_rate/100.0
-        if r>0:
-            ann_pay = loan_amt * (r*(1+r)**amort_years)/(((1+r)**amort_years)-1)
-        else:
-            ann_pay = loan_amt / amort_years
-        noi_y1_after = noi_y1
-        dscr_y1 = noi_y1_after / ann_pay if ann_pay>0 else np.nan
+        ann_pay = loan_amt * (r*(1+r)**amort_years)/(((1+r)**amort_years)-1) if r>0 else loan_amt / amort_years
+        dscr_y1 = noi_y1 / ann_pay if ann_pay>0 else np.nan
         st.metric("Loan Amount", f"{_fmt_num(loan_amt)}")
         st.metric("Annual Debt Service", f"{_fmt_num(ann_pay)}")
         st.metric("DSCR (Year 1)", f"{dscr_y1:.2f}")
@@ -555,16 +699,12 @@ with tabs[9]:
         disc = st.number_input("Discount Rate (%)", value=12.0)
         loan_rate = st.number_input("Construction Loan Rate (%)", value=9.0)
         ltc = st.number_input("LTC (%)", value=60.0)
-        # Cost curve (S-curve weights)
-        # Simple normalized weights: slower start/end, heavier middle
-        t_cost = build_years
-        if t_cost < 1: t_cost = 1
+        # S-curve weights
+        t_cost = max(1, int(build_years))
         x = np.linspace(0, 1, t_cost)
-        s_curve = 3*x**2 - 2*x**3  # smoothstep-esque
-        w = np.diff(np.hstack([[0], s_curve]))
-        w = w/ w.sum()
+        s_curve = 3*x**2 - 2*x**3
+        w = np.diff(np.hstack([[0], s_curve])); w = w/ w.sum()
         costs = total_cost * w
-        # Sales curve: linear over sell_years after build
         sales_each = price_total / sell_years
         years = list(range(1, build_years + sell_years + 1))
         cf = []
@@ -573,44 +713,36 @@ with tabs[9]:
         for t in years:
             if t <= build_years:
                 out = -costs[t-1]
-                # finance via LTC loan first
                 loan_cap = total_cost * (ltc/100.0)
-                draw = min(-out - 0.0, max(0.0, loan_cap - loan_drawn)) if out<0 else 0.0
+                draw = min(-out, max(0.0, loan_cap - loan_drawn)) if out<0 else 0.0
                 loan_drawn += draw
                 equity = -out - draw
                 equity_in += max(0, equity)
-                # interest on outstanding loan (simple annual)
                 interest = -loan_drawn * (loan_rate/100.0)
-                cf.append(out + interest)  # cost + interest (negative)
+                cf.append(out + interest)
             else:
                 inflow = sales_each
-                # interest continues until loan repaid; repay with first sales
                 interest = -loan_drawn * (loan_rate/100.0) if loan_drawn>0 else 0.0
                 repay = min(inflow, loan_drawn + (-interest))
                 loan_drawn = max(0.0, loan_drawn - repay)
-                net = inflow + interest - repay  # interest negative
+                net = inflow + interest - repay
                 cf.append(net)
-        # NPV & IRR (annual)
-        disc_rate = 1 + disc/100.0
-        npv = sum([cf[t-1]/(disc_rate**t) for t in years])
-        # IRR via numpy
+        npv = sum([cf[t-1]/((1+disc/100.0)**t) for t in years])
         try:
-            irr = np.irr([0.0] + cf)  # shift to t=0 zero; cash flows start at t=1
+            irr = npf.irr([0.0] + cf)
         except Exception:
             irr = np.nan
         st.metric("Equity Invested (approx.)", f"{_fmt_num(equity_in)}")
         st.metric("NPV (to time 0)", f"{_fmt_num(npv)}")
         st.metric("Project IRR (approx.)", f"{irr*100:.2f}%")
-        # Plot cash flows
         fig = plt.figure()
         plt.bar(years, cf)
         plt.axhline(0, linewidth=0.8)
         plt.title("Development Cash Flows by Year")
-        plt.xlabel("Year")
-        plt.ylabel("Cash Flow")
+        plt.xlabel("Year"); plt.ylabel("Cash Flow")
         st.pyplot(fig)
 
-# Final cache set (best-effort)
+# Final safe cache
 try:
     st.session_state["template_state"]["intrinsic_ps_cache"] = intrinsic_ps
 except Exception:
